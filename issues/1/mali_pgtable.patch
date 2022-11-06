@@ -1,0 +1,449 @@
+diff -ur 4.9/drivers/iommu/io-pgtable-arm.c patches/1.11/drivers/iommu/io-pgtable-arm.c
+--- 4.9/drivers/iommu/io-pgtable-arm.c	2022-11-01 21:39:10.227934400 +0000
++++ patches/1.11/drivers/iommu/io-pgtable-arm.c	2022-11-03 16:07:55.016949300 +0000
+@@ -20,6 +20,7 @@
+ 
+ #define pr_fmt(fmt)	"arm-lpae io-pgtable: " fmt
+ 
++#include <linux/io-pgtable.h>
+ #include <linux/iommu.h>
+ #include <linux/kernel.h>
+ #include <linux/sizes.h>
+@@ -29,8 +30,6 @@
+ 
+ #include <asm/barrier.h>
+ 
+-#include "io-pgtable.h"
+-
+ #define ARM_LPAE_MAX_ADDR_BITS		48
+ #define ARM_LPAE_S2_MAX_CONCAT_PAGES	16
+ #define ARM_LPAE_MAX_LEVELS		4
+@@ -156,6 +155,7 @@
+ #define ARM_LPAE_TCR_PS_42_BIT		0x3ULL
+ #define ARM_LPAE_TCR_PS_44_BIT		0x4ULL
+ #define ARM_LPAE_TCR_PS_48_BIT		0x5ULL
++#define ARM_LPAE_TCR_PS_52_BIT		0x6ULL
+ 
+ #define ARM_LPAE_MAIR_ATTR_SHIFT(n)	((n) << 3)
+ #define ARM_LPAE_MAIR_ATTR_MASK		0xff
+@@ -166,6 +166,13 @@
+ #define ARM_LPAE_MAIR_ATTR_IDX_CACHE	1
+ #define ARM_LPAE_MAIR_ATTR_IDX_DEV	2
+ 
++#define ARM_MALI_LPAE_TTBR_ADRMODE_TABLE (3u << 0)
++#define ARM_MALI_LPAE_TTBR_READ_INNER	BIT(2)
++#define ARM_MALI_LPAE_TTBR_SHARE_OUTER	BIT(4)
++
++#define ARM_MALI_LPAE_MEMATTR_IMP_DEF	0x88ULL
++#define ARM_MALI_LPAE_MEMATTR_WRITE_ALLOC 0x8DULL
++
+ /* IOPTE accessors */
+ #define iopte_deref(pte,d)					\
+ 	(__va((pte) & ((1ULL << ARM_LPAE_MAX_ADDR_BITS) - 1)	\
+@@ -176,8 +183,8 @@
+ 
+ #define iopte_prot(pte)	((pte) & ARM_LPAE_PTE_ATTR_MASK)
+ 
+-#define iopte_leaf(pte,l)					\
+-	(l == (ARM_LPAE_MAX_LEVELS - 1) ?			\
++#define iopte_leaf(pte,l,fmt)					\
++	((l == (ARM_LPAE_MAX_LEVELS - 1) && fmt != ARM_MALI_LPAE) ?			\
+ 		(iopte_type(pte,l) == ARM_LPAE_PTE_TYPE_PAGE) :	\
+ 		(iopte_type(pte,l) == ARM_LPAE_PTE_TYPE_BLOCK))
+ 
+@@ -217,7 +224,7 @@
+ 	if (!pages)
+ 		return NULL;
+ 
+-	if (!selftest_running) {
++	if (!selftest_running && !cfg->coherent_walk) {
+ 		dma = dma_map_single(dev, pages, size, DMA_TO_DEVICE);
+ 		if (dma_mapping_error(dev, dma))
+ 			goto out_free;
+@@ -243,7 +250,7 @@
+ static void __arm_lpae_free_pages(void *pages, size_t size,
+ 				  struct io_pgtable_cfg *cfg)
+ {
+-	if (!selftest_running)
++	if (!selftest_running && !cfg->coherent_walk)
+ 		dma_unmap_single(cfg->iommu_dev, __arm_lpae_dma_addr(pages),
+ 				 size, DMA_TO_DEVICE);
+ 	free_pages_exact(pages, size);
+@@ -260,6 +267,23 @@
+ 					   sizeof(pte), DMA_TO_DEVICE);
+ }
+ 
++static void __arm_lpae_sync_pte(arm_lpae_iopte *ptep,
++			       struct io_pgtable_cfg *cfg)
++{
++	dma_sync_single_for_device(cfg->iommu_dev,
++					   __arm_lpae_dma_addr(ptep),
++					   sizeof(*ptep), DMA_TO_DEVICE);
++}
++
++static void __arm_lpae_clear_pte(arm_lpae_iopte *ptep,
++			       struct io_pgtable_cfg *cfg)
++{
++	WRITE_ONCE(*ptep, 0);
++
++	if (!cfg->coherent_walk)
++		__arm_lpae_sync_pte(ptep, cfg);
++}
++
+ static int __arm_lpae_unmap(struct arm_lpae_io_pgtable *data,
+ 			    unsigned long iova, size_t size, int lvl,
+ 			    arm_lpae_iopte *ptep);
+@@ -272,7 +296,7 @@
+ 	arm_lpae_iopte pte = prot;
+ 	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+ 
+-	if (iopte_leaf(*ptep, lvl)) {
++	if (iopte_leaf(*ptep, lvl, data->iop.fmt)) {
+ 		/* We require an unmap first */
+ 		WARN_ON(!selftest_running);
+ 		return -EEXIST;
+@@ -292,7 +316,7 @@
+ 	if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_NS)
+ 		pte |= ARM_LPAE_PTE_NS;
+ 
+-	if (lvl == ARM_LPAE_MAX_LEVELS - 1)
++	if (data->iop.fmt != ARM_MALI_LPAE && lvl == ARM_LPAE_MAX_LEVELS - 1)
+ 		pte |= ARM_LPAE_PTE_TYPE_PAGE;
+ 	else
+ 		pte |= ARM_LPAE_PTE_TYPE_BLOCK;
+@@ -300,16 +324,51 @@
+ 	pte |= ARM_LPAE_PTE_AF | ARM_LPAE_PTE_SH_IS;
+ 	pte |= pfn_to_iopte(paddr >> data->pg_shift, data);
+ 
+-	__arm_lpae_set_pte(ptep, pte, cfg);
++	WRITE_ONCE(*ptep, pte);
++	if (!cfg->coherent_walk)
++		__arm_lpae_sync_pte(ptep, cfg);
+ 	return 0;
+ }
+ 
++static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
++					     arm_lpae_iopte *ptep,
++					     arm_lpae_iopte curr,
++					     struct arm_lpae_io_pgtable *data)
++{
++	arm_lpae_iopte old, new;
++	struct io_pgtable_cfg *cfg = &data->iop.cfg;
++
++	new = __pa(cptep) | ARM_LPAE_PTE_TYPE_TABLE;
++	if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_NS)
++		new |= ARM_LPAE_PTE_NSTABLE;
++
++	/*
++	 * Ensure the table itself is visible before its PTE can be.
++	 * Whilst we could get away with cmpxchg64_release below, this
++	 * doesn't have any ordering semantics when !CONFIG_SMP.
++	 */
++	dma_wmb();
++
++	old = cmpxchg64_relaxed(ptep, curr, new);
++
++	if (cfg->coherent_walk || (old & ARM_LPAE_PTE_SW_SYNC))
++		return old;
++
++	/* Even if it's not ours, there's no point waiting; just kick it */
++	__arm_lpae_sync_pte(ptep, cfg);
++	if (old == curr)
++		WRITE_ONCE(*ptep, new | ARM_LPAE_PTE_SW_SYNC);
++
++	return old;
++}
++
+ static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
+ 			  phys_addr_t paddr, size_t size, arm_lpae_iopte prot,
+ 			  int lvl, arm_lpae_iopte *ptep)
+ {
+ 	arm_lpae_iopte *cptep, pte;
+ 	size_t block_size = ARM_LPAE_BLOCK_SIZE(lvl, data);
++	size_t tblsz = ARM_LPAE_GRANULE(data);
+ 	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+ 
+ 	/* Find our entry at the current level */
+@@ -324,20 +383,22 @@
+ 		return -EINVAL;
+ 
+ 	/* Grab a pointer to the next level */
+-	pte = *ptep;
++	pte = READ_ONCE(*ptep);
+ 	if (!pte) {
+-		cptep = __arm_lpae_alloc_pages(ARM_LPAE_GRANULE(data),
+-					       GFP_ATOMIC, cfg);
++		cptep = __arm_lpae_alloc_pages(tblsz, gfp, cfg);
+ 		if (!cptep)
+ 			return -ENOMEM;
+ 
+-		pte = __pa(cptep) | ARM_LPAE_PTE_TYPE_TABLE;
+-		if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_NS)
+-			pte |= ARM_LPAE_PTE_NSTABLE;
+-		__arm_lpae_set_pte(ptep, pte, cfg);
+-	} else if (!iopte_leaf(pte, lvl)) {
++		pte = arm_lpae_install_table(cptep, ptep, 0, data);
++		if (pte)
++			__arm_lpae_free_pages(cptep, tblsz, cfg);
++	} else if (!cfg->coherent_walk && !(pte & ARM_LPAE_PTE_SW_SYNC)) {
++		__arm_lpae_sync_pte(ptep, 1, cfg);
++	}
++
++	if (pte && !iopte_leaf(pte, lvl, data->iop.fmt)) {
+ 		cptep = iopte_deref(pte, data);
+-	} else {
++	} else if (pte) {
+ 		/* We require an unmap first */
+ 		WARN_ON(!selftest_running);
+ 		return -EEXIST;
+@@ -379,9 +440,26 @@
+ 			pte |= ARM_LPAE_PTE_MEMATTR_NC;
+ 	}
+ 
++	/*
++	 * Also Mali has its own notions of shareability wherein its Inner
++	 * domain covers the cores within the GPU, and its Outer domain is
++	 * "outside the GPU" (i.e. either the Inner or System domain in CPU
++	 * terms, depending on coherency).
++	 */
++	if (prot & IOMMU_CACHE && data->iop.fmt != ARM_MALI_LPAE)
++		pte |= ARM_LPAE_PTE_SH_IS;
++	else
++		pte |= ARM_LPAE_PTE_SH_OS;
++
+ 	if (prot & IOMMU_NOEXEC)
+ 		pte |= ARM_LPAE_PTE_XN;
+ 
++	if (data->iop.cfg.quirks & IO_PGTABLE_QUIRK_ARM_NS)
++		pte |= ARM_LPAE_PTE_NS;
++
++	if (data->iop.fmt != ARM_MALI_LPAE)
++		pte |= ARM_LPAE_PTE_AF;
++
+ 	return pte;
+ }
+ 
+@@ -430,7 +508,7 @@
+ 	while (ptep != end) {
+ 		arm_lpae_iopte pte = *ptep++;
+ 
+-		if (!pte || iopte_leaf(pte, lvl))
++		if (!pte || iopte_leaf(pte, lvl, data->iop.fmt))
+ 			continue;
+ 
+ 		__arm_lpae_free_pgtable(data, lvl + 1, iopte_deref(pte, data));
+@@ -452,6 +530,7 @@
+ 				    arm_lpae_iopte prot, int lvl,
+ 				    arm_lpae_iopte *ptep, size_t blk_size)
+ {
++	struct io_pgtable_cfg *cfg = &data->iop.cfg;
+ 	unsigned long blk_start, blk_end;
+ 	phys_addr_t blk_paddr;
+ 	arm_lpae_iopte table = 0;
+@@ -480,7 +559,9 @@
+ 		}
+ 	}
+ 
+-	__arm_lpae_set_pte(ptep, table, &data->iop.cfg);
++	WRITE_ONCE(*ptep, table);
++	if(!cfg->coherent_walk)
++		__arm_lpae_sync_pte(ptep, &data->iop.cfg);
+ 	iova &= ~(blk_size - 1);
+ 	io_pgtable_tlb_add_flush(&data->iop, iova, blk_size, blk_size, true);
+ 	return size;
+@@ -505,9 +586,9 @@
+ 
+ 	/* If the size matches this level, we're in the right place */
+ 	if (size == blk_size) {
+-		__arm_lpae_set_pte(ptep, 0, &iop->cfg);
++		__arm_lpae_clear_pte(ptep, &iop->cfg);
+ 
+-		if (!iopte_leaf(pte, lvl)) {
++		if (!iopte_leaf(pte, lvl, iop->fmt)) {
+ 			/* Also flush any partial walks */
+ 			io_pgtable_tlb_add_flush(iop, iova, size,
+ 						ARM_LPAE_GRANULE(data), false);
+@@ -519,7 +600,7 @@
+ 		}
+ 
+ 		return size;
+-	} else if (iopte_leaf(pte, lvl)) {
++	} else if (iopte_leaf(pte, lvl, iop->fmt)) {
+ 		/*
+ 		 * Insert a table at the next level to map the old region,
+ 		 * minus the part we want to unmap
+@@ -569,7 +650,7 @@
+ 			return 0;
+ 
+ 		/* Leaf entry? */
+-		if (iopte_leaf(pte,lvl))
++		if (iopte_leaf(pte,lvl,data->iop.fmt))
+ 			goto found_translation;
+ 
+ 		/* Take it to the next level */
+@@ -678,9 +759,15 @@
+ 		return NULL;
+ 
+ 	/* TCR */
+-	reg = (ARM_LPAE_TCR_SH_IS << ARM_LPAE_TCR_SH0_SHIFT) |
+-	      (ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_IRGN0_SHIFT) |
+-	      (ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_ORGN0_SHIFT);
++	if (cfg->coherent_walk) {
++		reg = (ARM_LPAE_TCR_SH_IS << ARM_LPAE_TCR_SH0_SHIFT) |
++			(ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_IRGN0_SHIFT) |
++			(ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_ORGN0_SHIFT);
++	} else {
++		reg = (ARM_LPAE_TCR_SH_OS << ARM_LPAE_TCR_SH0_SHIFT) |
++			(ARM_LPAE_TCR_RGN_NC << ARM_LPAE_TCR_IRGN0_SHIFT) |
++			(ARM_LPAE_TCR_RGN_NC << ARM_LPAE_TCR_ORGN0_SHIFT);
++	}
+ 
+ 	switch (ARM_LPAE_GRANULE(data)) {
+ 	case SZ_4K:
+@@ -713,6 +800,9 @@
+ 	case 48:
+ 		reg |= (ARM_LPAE_TCR_PS_48_BIT << ARM_LPAE_TCR_IPS_SHIFT);
+ 		break;
++	case 52:
++		reg |= (ARM_LPAE_TCR_PS_52_BIT << ARM_LPAE_TCR_IPS_SHIFT);
++		break;
+ 	default:
+ 		goto out_free_data;
+ 	}
+@@ -781,10 +871,17 @@
+ 	}
+ 
+ 	/* VTCR */
+-	reg = ARM_64_LPAE_S2_TCR_RES1 |
+-	     (ARM_LPAE_TCR_SH_IS << ARM_LPAE_TCR_SH0_SHIFT) |
+-	     (ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_IRGN0_SHIFT) |
+-	     (ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_ORGN0_SHIFT);
++	if (cfg->coherent_walk) {
++		reg = ARM_64_LPAE_S2_TCR_RES1 |
++			(ARM_LPAE_TCR_SH_IS << ARM_LPAE_TCR_SH0_SHIFT) |
++			(ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_IRGN0_SHIFT) |
++			(ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_ORGN0_SHIFT);
++	} else {
++		reg = ARM_64_LPAE_S2_TCR_RES1 |
++			(ARM_LPAE_TCR_SH_IS << ARM_LPAE_TCR_SH0_SHIFT) |
++			(ARM_LPAE_TCR_RGN_NC << ARM_LPAE_TCR_IRGN0_SHIFT) |
++			(ARM_LPAE_TCR_RGN_NC << ARM_LPAE_TCR_ORGN0_SHIFT);
++	}
+ 
+ 	sl = ARM_LPAE_START_LVL(data);
+ 
+@@ -820,6 +917,9 @@
+ 	case 48:
+ 		reg |= (ARM_LPAE_TCR_PS_48_BIT << ARM_LPAE_TCR_PS_SHIFT);
+ 		break;
++	case 52:
++		reg |= (ARM_LPAE_TCR_PS_52_BIT << ARM_LPAE_TCR_PS_SHIFT);
++		break;
+ 	default:
+ 		goto out_free_data;
+ 	}
+@@ -879,6 +979,65 @@
+ 	return iop;
+ }
+ 
++static struct io_pgtable *
++arm_mali_lpae_alloc_pgtable(struct io_pgtable_cfg *cfg, void *cookie)
++{
++	struct arm_lpae_io_pgtable *data;
++
++	/* No quirks for Mali (hopefully) */
++	if (cfg->quirks)
++		return NULL;
++
++	if (cfg->ias > 48 || cfg->oas > 40)
++		return NULL;
++
++	cfg->pgsize_bitmap &= (SZ_4K | SZ_2M | SZ_1G);
++
++	data = arm_lpae_alloc_pgtable(cfg);
++	if (!data)
++		return NULL;
++
++	/* Mali seems to need a full 4-level table regardless of IAS */
++	if (data->start_level > 0) {
++		data->start_level = 0;
++		data->pgd_bits = 0;
++	}
++	/*
++	 * MEMATTR: Mali has no actual notion of a non-cacheable type, so the
++	 * best we can do is mimic the out-of-tree driver and hope that the
++	 * "implementation-defined caching policy" is good enough. Similarly,
++	 * we'll use it for the sake of a valid attribute for our 'device'
++	 * index, although callers should never request that in practice.
++	 */
++	cfg->arm_mali_lpae_cfg.memattr =
++		(ARM_MALI_LPAE_MEMATTR_IMP_DEF
++		 << ARM_LPAE_MAIR_ATTR_SHIFT(ARM_LPAE_MAIR_ATTR_IDX_NC)) |
++		(ARM_MALI_LPAE_MEMATTR_WRITE_ALLOC
++		 << ARM_LPAE_MAIR_ATTR_SHIFT(ARM_LPAE_MAIR_ATTR_IDX_CACHE)) |
++		(ARM_MALI_LPAE_MEMATTR_IMP_DEF
++		 << ARM_LPAE_MAIR_ATTR_SHIFT(ARM_LPAE_MAIR_ATTR_IDX_DEV));
++
++	data->pgd = __arm_lpae_alloc_pages(data->pgd_size, GFP_KERNEL,
++					   cfg);
++	if (!data->pgd)
++		goto out_free_data;
++
++	/* Ensure the empty pgd is visible before TRANSTAB can be written */
++	wmb();
++
++	cfg->arm_mali_lpae_cfg.transtab = virt_to_phys(data->pgd) |
++					  ARM_MALI_LPAE_TTBR_READ_INNER |
++					  ARM_MALI_LPAE_TTBR_ADRMODE_TABLE;
++	if (cfg->coherent_walk)
++		cfg->arm_mali_lpae_cfg.transtab |= ARM_MALI_LPAE_TTBR_SHARE_OUTER;
++
++	return &data->iop;
++
++out_free_data:
++	kfree(data);
++	return NULL;
++}
++
+ struct io_pgtable_init_fns io_pgtable_arm_64_lpae_s1_init_fns = {
+ 	.alloc	= arm_64_lpae_alloc_pgtable_s1,
+ 	.free	= arm_lpae_free_pgtable,
+@@ -899,6 +1058,11 @@
+ 	.free	= arm_lpae_free_pgtable,
+ };
+ 
++struct io_pgtable_init_fns io_pgtable_arm_mali_lpae_init_fns = {
++	.alloc	= arm_mali_lpae_alloc_pgtable,
++	.free	= arm_lpae_free_pgtable,
++};
++
+ #ifdef CONFIG_IOMMU_IO_PGTABLE_LPAE_SELFTEST
+ 
+ static struct io_pgtable_cfg *cfg_cookie;
+@@ -1065,6 +1229,7 @@
+ 	int i, j, pass = 0, fail = 0;
+ 	struct io_pgtable_cfg cfg = {
+ 		.tlb = &dummy_tlb_ops,
++		.coherent_walk = true,
+ 		.oas = 48,
+ 	};
+ 
+diff -ur 4.9/drivers/iommu/io-pgtable.c patches/1.11/drivers/iommu/io-pgtable.c
+--- 4.9/drivers/iommu/io-pgtable.c	2022-11-01 21:39:13.147934400 +0000
++++ patches/1.11/drivers/iommu/io-pgtable.c	2022-11-01 21:39:41.747934400 +0000
+@@ -18,12 +18,11 @@
+  * Author: Will Deacon <will.deacon@arm.com>
+  */
+ 
++#include <linux/io-pgtable.h>
+ #include <linux/bug.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+ 
+-#include "io-pgtable.h"
+-
+ static const struct io_pgtable_init_fns *
+ io_pgtable_init_table[IO_PGTABLE_NUM_FMTS] = {
+ #ifdef CONFIG_IOMMU_IO_PGTABLE_LPAE
+Only in 4.9/drivers/iommu: io-pgtable.h
+Only in patches/1.11: include

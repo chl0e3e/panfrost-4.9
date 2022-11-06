@@ -1,0 +1,609 @@
+1) Linux 4.9 does not expose io-pgtable header, and, io-pgtable is also
+missing an implementation of the ARM_MALI_LPAE page format.
+Various page selection helpers are missing the formatting enum which changes
+the behaviours in the io-pgtable-arm.c implementation
+
+user@DESKTOP-AVLTLKA:~$ find linux-bpi | grep io-pgtable
+linux-bpi/BPI-W2-bsp-original/linux-rtk/drivers/iommu/io-pgtable.h
+linux-bpi/BPI-W2-bsp-original/linux-rtk/drivers/iommu/io-pgtable-arm-v7s.c
+linux-bpi/BPI-W2-bsp-original/linux-rtk/drivers/iommu/io-pgtable.c
+linux-bpi/BPI-W2-bsp-original/linux-rtk/drivers/iommu/io-pgtable-arm.c
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/io-pgtable.h
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/io-pgtable-arm-v7s.c
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/io-pgtable.c
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/io-pgtable-arm.c
+user@DESKTOP-AVLTLKA:~$ find linux-panfrost | grep io-pgtable
+linux-panfrost/linux/include/linux/io-pgtable.h
+linux-panfrost/linux/drivers/iommu/io-pgtable-arm.h
+linux-panfrost/linux/drivers/iommu/io-pgtable-arm-v7s.c
+linux-panfrost/linux/drivers/iommu/io-pgtable-dart.c
+linux-panfrost/linux/drivers/iommu/io-pgtable.c
+linux-panfrost/linux/drivers/iommu/io-pgtable-arm.c
+
+1.1) Expand io_pgtable_fmt enum to allow `ARM_MALI_LPAE`
+
+1.2) Add in the `ARM_MALI_LPAE` register bits
+
+1.3) Update references of `iopte_leaf` to check if structure defined as
+`arm_lpae_io_pgtable` has a format matching ARM_MALI_LPAE.
+
+1.4) Investigate depth of memory protection bits: arm_lpae_prot_to_pte
+1.4.1) Linux 4.9 structures the code for format of the page walk prot
+differently, aiding confusion. The comments do document this, however,
+take care as the code is not self-documenting and checks missing for
+the format enum may slip you up. Since the stage-1 and stage-2 bit perms
+are correctly set in their if statement, these will not be modified.
+1.4.2) The checks after however regarding the shareability, quirks and
+non-Mali perm-bits are needing tweaks and tests to see if the shared RAM
+operates correctly.
+1.4) Following investigations, the changes to arm_lpae_prot_to_pte will
+be integrated.
+
+	/*
+	 * Also Mali has its own notions of shareability wherein its Inner
+	 * domain covers the cores within the GPU, and its Outer domain is
+	 * "outside the GPU" (i.e. either the Inner or System domain in CPU
+	 * terms, depending on coherency).
+	 */
+	if (prot & IOMMU_CACHE && data->iop.fmt != ARM_MALI_LPAE)
+		pte |= ARM_LPAE_PTE_SH_IS;
+	else
+		pte |= ARM_LPAE_PTE_SH_OS;
+
+	if (prot & IOMMU_NOEXEC)
+		pte |= ARM_LPAE_PTE_XN;
+
+	if (data->iop.cfg.quirks & IO_PGTABLE_QUIRK_ARM_NS)
+		pte |= ARM_LPAE_PTE_NS;
+
+	if (data->iop.fmt != ARM_MALI_LPAE)
+		pte |= ARM_LPAE_PTE_AF;
+
+Other references to ARM_LPAE_PTE_SH_IS have been found and will also
+be integrated in 1.5.
+
+1.5) Linux 6.0 ensures that `ARM_LPAE_PTE_TYPE_BLOCK` bit is set
+when using Mali's page table format similar to iopte_leaf in 1.3.
+This can be found in `arm_lpae_init_pte' and changes the check:
+
+Before:
+
+if (lvl == ARM_LPAE_MAX_LEVELS - 1)
+	pte |= ARM_LPAE_PTE_TYPE_PAGE;
+else
+	pte |= ARM_LPAE_PTE_TYPE_BLOCK;
+
+After:
+
+if (data->iop.fmt != ARM_MALI_LPAE && lvl == ARM_LPAE_MAX_LEVELS - 1)
+	pte |= ARM_LPAE_PTE_TYPE_PAGE;
+else
+	pte |= ARM_LPAE_PTE_TYPE_BLOCK;
+
+1.6) Linux 6.0 made changes to the page table's configuration struc-
+-ture which allow to enable/disable a `coherent_walk`. It was disco-
+-vered in the `__arm_lpae_init_pte` function which initialises the 
+permission table. v1, v2 and v3 of the ARM SMMU allow coherent walks
+and set the coherent_walk flag when finalising the SMUU domain.
+
+SMMU v3     `arm_smmu_init_domain_context`
+v6          linux/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+v4.9        linux-rtk/drivers/iommu/arm-smmu-v3.c
+
+SMMU v1&2  `arm_smmu_domain_finalise`
+v6          linux/drivers/iommu/arm/arm-smmu/arm-smmu.c
+v4.9        linux-rtk/drivers/iommu/arm-smmu.c
+
+This will be changed later in issue 3. Issue 2 is reserved for patches
+to coherent_walk in `io-pgtable-arm-v7s.c`
+See: 4f41845b340783eaec9cc2840fe3cb9a00574054
+
+1.6.1) Add `coherent_walk` to the configuration structure in
+`io-pgtable.h`. This presumingly supports for staging changes to
+the PTE bits.
+1.6.2) Backport usage of `coherent_walk` in `io-pgtable-arm.c`
+See: 4f41845b340783eaec9cc2840fe3cb9a00574054
+     a) `__arm_lpae_alloc_pages` was given coherent_walk on the 
+	 same statement as the selftest_running check
+	 b) `__arm_lpae_free_pages' was given coherent_walk on the same
+	 statement as the selftest_running check
+	 c) `__arm_lpae_clear_pte' does not exist in Linux 4.9 and will
+	 be ported from Linux 6.0.
+	 
+	static void __arm_lpae_clear_pte(arm_lpae_iopte *ptep,
+							struct io_pgtable_cfg *cfg)
+	{
+		WRITE_ONCE(*ptep, pte);
+
+		if (!cfg->coherent_walk)
+			__arm_lpae_sync_pte(ptep, cfg);
+	}
+
+...
+
+	if (size == blk_size) {
+-		__arm_lpae_set_pte(ptep, 0, &iop->cfg);
++		__arm_lpae_clear_pte(ptep, &iop->cfg);
+
+		if (!iopte_leaf(pte, lvl, iop->fmt)) {
+
+	 d) `arm_lpae_init_pte' was given coherent_walk by duplicating
+	 `__arm_lpae_sync_pte` which is different to
+	 `__arm_lpae_set_pte'. New function is as follows:
+	 
+	static void __arm_lpae_sync_pte(arm_lpae_iopte *ptep,
+							struct io_pgtable_cfg *cfg)
+	{
+		dma_sync_single_for_device(cfg->iommu_dev,
+			__arm_lpae_dma_addr(ptep),
+			sizeof(*ptep), DMA_TO_DEVICE);
+	}
+
+	 ptep is manually set after 
+
+>	pte |= pfn_to_iopte(paddr >> data->pg_shift, data);
+
+     as such:
+
++	WRITE_ONCE(*ptep, pte);
+
+	 then a sync is manually performed resulting in
+	 
+-	__arm_lpae_set_pte(ptep, pte, cfg);
++	WRITE_ONCE(*ptep, pte);
++	if (!cfg->coherent_walk)
++		__arm_lpae_sync_pte(ptep, cfg);
+
+	 e) `arm_lpae_install_table' is a new function which sets up a
+	 page and installs the table:
+	 The operations for installing the table are mostly the same as
+	 4.9, however, when setting up the PTE bits, a CMPXCHG64 occurs
+	 which swaps out the PTE values and returns the old one.
+	 6.0 also has the usage of `ARM_LPAE_PTE_SW_SYNC` where it does
+	 additional checks maintaining the synchronicity.
+
+	 Starting with the flag definitions, `ARM_LPAE_PTE_SW_SYNC` is
+	 introduced.
+
+	 /* Software bit for solving coherency races */
+	 #define ARM_LPAE_PTE_SW_SYNC		(((arm_lpae_iopte)1) << 55)
+
+	 The table installation is then copied into a function and a few
+	 variables are copied to make them compatible with the
+	 single page system.
+	 
+
+=============== 6.0
+	static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
+			arm_lpae_iopte *ptep,
+			arm_lpae_iopte curr,
+			struct arm_lpae_io_pgtable *data)
+	{
+		arm_lpae_iopte old, new;
+		struct io_pgtable_cfg *cfg = &data->iop.cfg;
+
+		new = paddr_to_iopte(__pa(table), data) | ARM_LPAE_PTE_TYPE_TABLE;
+		if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_NS)
+			new |= ARM_LPAE_PTE_NSTABLE;
+=============== 4.9
+
+		pte = __pa(cptep) | ARM_LPAE_PTE_TYPE_TABLE;
+		if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_NS)
+			pte |= ARM_LPAE_PTE_NSTABLE;
+		__arm_lpae_set_pte(ptep, pte, cfg);
+
+=============== 6.0
+
+
+		/*
+		* Ensure the table itself is visible before its PTE can be.
+		* Whilst we could get away with cmpxchg64_release below, this
+		* doesn't have any ordering semantics when !CONFIG_SMP.
+		*/
+		dma_wmb();
+
+		old = cmpxchg64_relaxed(ptep, curr, new);
+
+		if (cfg->coherent_walk || (old & ARM_LPAE_PTE_SW_SYNC))
+			return old;
+
+		/* Even if it's not ours, there's no point waiting; just kick it */
+		__arm_lpae_sync_pte(ptep, 1, cfg);
+		if (old == curr)
+			WRITE_ONCE(*ptep, new | ARM_LPAE_PTE_SW_SYNC);
+
+		return old;
+	}
+===============
+
+       f) `__arm_lpae_map` also bares differences
+
+=============== OLD
+
+		/* Grab a pointer to the next level */
+		pte = *ptep;
+		if (!pte) {
+			cptep = __arm_lpae_alloc_pages(ARM_LPAE_GRANULE(data),
+							GFP_ATOMIC, cfg);
+			if (!cptep)
+				return -ENOMEM;
+
+			pte = __pa(cptep) | ARM_LPAE_PTE_TYPE_TABLE;
+			if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_NS)
+				pte |= ARM_LPAE_PTE_NSTABLE;
+			__arm_lpae_set_pte(ptep, pte, cfg);
+		} else if (!iopte_leaf(pte, lvl)) {
+			cptep = iopte_deref(pte, data);
+		} else {
+			/* We require an unmap first */
+			WARN_ON(!selftest_running);
+			return -EEXIST;
+		}
+
+=============== NEW
+		size_t tblsz = ARM_LPAE_GRANULE(data);
+
+		...
+
+		/* Grab a pointer to the next level */
+		pte = READ_ONCE(*ptep);
+		if (!pte) {
+			cptep = __arm_lpae_alloc_pages(tblsz, gfp, cfg);
+			if (!cptep)
+				return -ENOMEM;
+	
+			pte = arm_lpae_install_table(cptep, ptep, 0, data);
+			if (pte)
+				__arm_lpae_free_pages(cptep, tblsz, cfg);
+		} else if (!cfg->coherent_walk && !(pte & ARM_LPAE_PTE_SW_SYNC)) {
+			__arm_lpae_sync_pte(ptep, 1, cfg);
+		}
+	
+		if (pte && !iopte_leaf(pte, lvl, data->iop.fmt)) {
+			cptep = iopte_deref(pte, data);
+		} else if (pte) {
+			/* We require an unmap first */
+			WARN_ON(!selftest_running);
+			return -EEXIST;
+		}
+
+===============
+
+      g) After this, the `arm_lpae_split_blk_unmap` function will need a
+         sync step where the pte is flushed, so get the cfg, set ptep and
+		 sync.
+		
++ 		struct io_pgtable_cfg *cfg = &data->iop.cfg;
+...
++		WRITE_ONCE(*ptep, table);
++		if(!cfg->coherent_walk)
++			__arm_lpae_sync_pte(ptep, &data->iop.cfg);
+      h) `arm_64_lpae_alloc_pgtable_s1' is using more flags and quirks,
+	     but this should be a simple port.
+
+			
+	if (cfg->coherent_walk) {
+		reg = (ARM_LPAE_TCR_SH_IS << ARM_LPAE_TCR_SH0_SHIFT) |
+			(ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_IRGN0_SHIFT) |
+			(ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_ORGN0_SHIFT);
+	} else {
+		reg = (ARM_LPAE_TCR_SH_OS << ARM_LPAE_TCR_SH0_SHIFT) |
+			(ARM_LPAE_TCR_RGN_NC << ARM_LPAE_TCR_IRGN0_SHIFT) |
+			(ARM_LPAE_TCR_RGN_NC << ARM_LPAE_TCR_ORGN0_SHIFT);
+	}
+	  i) `arm_64_lpae_alloc_pgtable_s2` should have the same process
+	  
+	if (cfg->coherent_walk) {
+		reg = ARM_64_LPAE_S2_TCR_RES1 |
+			(ARM_LPAE_TCR_SH_IS << ARM_LPAE_TCR_SH0_SHIFT) |
+			(ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_IRGN0_SHIFT) |
+			(ARM_LPAE_TCR_RGN_WBWA << ARM_LPAE_TCR_ORGN0_SHIFT);
+	} else {
+		reg = ARM_64_LPAE_S2_TCR_RES1 |
+			(ARM_LPAE_TCR_SH_IS << ARM_LPAE_TCR_SH0_SHIFT) |
+			(ARM_LPAE_TCR_RGN_NC << ARM_LPAE_TCR_IRGN0_SHIFT) |
+			(ARM_LPAE_TCR_RGN_NC << ARM_LPAE_TCR_ORGN0_SHIFT);
+	}
+
+	  ARM_LPAE_GRANULE switch has not been ported in h) and i)
+	 
+      j) After, `__arm_lpae_sync_pte` in 6.0 will need investigating
+to ensure coherency. 2c3d273eabe8b1ed3b3cffe2c79643b1bf7e2d4a states
+this relates to supporting lockless operation "For parallel I/O with
+multiple concurrent threads".
+
+1.7) Linux 6.0 adds a configuration for Mali LPAE tables indicating
+the translation table and memory attributes. This can be found in
+`io-pgtable.h` under struct `io_pgtable_cfg`
+1.8) Define function `arm_mali_lpae_alloc_pgtable` and copy across,
+changing it to resemble the ARM64 stage2 allocation code.
+1.9) Define init functions in `io_pgtable_arm_mali_lpae_init_fns`
+Do not miss the struct in `io-pgtable.h'
+
+	extern struct io_pgtable_init_fns io_pgtable_arm_v7s_init_fns;
+
+	struct io_pgtable_init_fns io_pgtable_arm_mali_lpae_init_fns = {
+		.alloc	= arm_mali_lpae_alloc_pgtable,
+		.free	= arm_lpae_free_pgtable,
+	};
+
+1.10) Move io-pgtable.h to a kernel headers folder and
+update the #include preprocessors
+1.11) Add `coherent_walk` to `arm_lpae_do_selftests'
+
+2) As Cortex-A53 also requires the ARMV7s set for 32-bit ARM proce-
+-sses, the v7s pgtable implementation will be patched to support
+coherent_walk. See reference 1 for more information.
+2.1) Update `io-pgtable-armv7s.c' to use `linux/io-pgtable.h`
+2.2) Add `coherent_walk' checks for cache coherency
+   a) `__arm_v7s_alloc_table' - added a `coherent_walk` check when
+   a table is correctly initialised and the page is mapped
+   b) `__arm_v7s_free_table' - only sync for incoherent walks
+   c) `__arm_v7s_pte_sync` - prevent incoherent sync
+   d) `arm_v7s_alloc_pgtable' - added coherent walk by copying
+   6.0 and replacing in to `paddr`
+   e) `arm_v7s_do_selftests` - always coherent walk during
+   selftests
+
+3) As stated previously, the SMMU sets a boolean with the 2
+functions below so you can tell that the page table uses
+coherent walking.
+
+There are also other things which may need to be rectified in the
+iommu drivers, so a good read through will benefit us greatly.
+
+First, see: 4f41845b340783eaec9cc2840fe3cb9a00574054
+
+SMMU v3     `arm_smmu_init_domain_context`
+v6          linux/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+v4.9        linux-rtk/drivers/iommu/arm-smmu-v3.c
+
+SMMU v1&2  `arm_smmu_domain_finalise`
+v6          linux/drivers/iommu/arm/arm-smmu/arm-smmu.c
+v4.9        linux-rtk/drivers/iommu/arm-smmu.c
+
+These parts will be modified to set the COHERENT_WALK bits.
+This should allow our 4.9 kernel to create page tables which
+instead can adhere to coherency factors.
+
+--) This issue will not be performed, however, it may be at
+a later date if necessary. In 6.0, Linux can tell through its API
+whether or not the SMMU has a coherent cache. This is helpful and
+is being used in several places in the code base, however, there
+are no active codepaths that would actually benefit from this.
+There are some greps under Reference 2 that let you see where the
+`arm_smmu_capable' may be used.
+
+
+
+
+
+References:
+
+1. https://developer.arm.com/documentation/ddi0500/e/memory-management-unit/about-the-mmu
+2. `coherency references in BPI-W2@4.9`
+
+user@DESKTOP-AVLTLKA:~$ grep -r iommu_capable linux-bpi/BPI-W2-bsp/linux-rtk
+linux-bpi/BPI-W2-bsp/linux-rtk/arch/x86/kvm/iommu.c:    noncoherent = !iommu_capable(&pci_bus_type, IOMMU_CAP_CACHE_COHERENCY);
+linux-bpi/BPI-W2-bsp/linux-rtk/arch/x86/kvm/iommu.c:        !iommu_capable(&pci_bus_type, IOMMU_CAP_INTR_REMAP)) {
+linux-bpi/BPI-W2-bsp/linux-rtk/include/linux/iommu.h:extern bool iommu_capable(struct bus_type *bus, enum iommu_cap cap);
+linux-bpi/BPI-W2-bsp/linux-rtk/include/linux/iommu.h:static inline bool iommu_capable(struct bus_type *bus, enum iommu_cap cap)
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/tegra-gart.c:static bool gart_iommu_capable(enum iommu_cap cap)
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/tegra-gart.c:      .capable        = gart_iommu_capable,
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/intel-iommu.c:static bool intel_iommu_capable(enum iommu_cap cap)
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/intel-iommu.c:     .capable        = intel_iommu_capable,
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/amd_iommu.c:static bool amd_iommu_capable(enum iommu_cap cap)
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/amd_iommu.c:       .capable = amd_iommu_capable,
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/s390-iommu.c:static bool s390_iommu_capable(enum iommu_cap cap)
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/s390-iommu.c:      .capable = s390_iommu_capable,
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/msm_iommu.c:static bool msm_iommu_capable(enum iommu_cap cap)
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/msm_iommu.c:       .capable = msm_iommu_capable,
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/iommu.c:bool iommu_capable(struct bus_type *bus, enum iommu_cap cap)
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/iommu.c:EXPORT_SYMBOL_GPL(iommu_capable);
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/vfio/vfio_iommu_type1.c:     !iommu_capable(bus, IOMMU_CAP_INTR_REMAP)) {
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/vfio/vfio_iommu_type1.c: if (iommu_capable(bus, IOMMU_CAP_CACHE_COHERENCY))
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/infiniband/hw/usnic/usnic_uiom.c:        if (!iommu_capable(dev->bus, IOMMU_CAP_CACHE_COHERENCY)) {
+user@DESKTOP-AVLTLKA:~$ grep -r IOMMU_CAP_CACHE_COHERENCY linux-bpi/BPI-W2-bsp/linux-rtk
+linux-bpi/BPI-W2-bsp/linux-rtk/arch/x86/kvm/iommu.c:    noncoherent = !iommu_capable(&pci_bus_type, IOMMU_CAP_CACHE_COHERENCY);
+linux-bpi/BPI-W2-bsp/linux-rtk/include/linux/iommu.h:   IOMMU_CAP_CACHE_COHERENCY,      /* IOMMU can enforce cache coherent DMA
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/intel-iommu.c:     if (cap == IOMMU_CAP_CACHE_COHERENCY)
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/amd_iommu.c:       case IOMMU_CAP_CACHE_COHERENCY:
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/s390-iommu.c:      case IOMMU_CAP_CACHE_COHERENCY:
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/arm-smmu-v3.c:     case IOMMU_CAP_CACHE_COHERENCY:
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/fsl_pamu_domain.c: return cap == IOMMU_CAP_CACHE_COHERENCY;
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/arm-smmu.c:        case IOMMU_CAP_CACHE_COHERENCY:
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/vfio/vfio_iommu_type1.c: if (iommu_capable(bus, IOMMU_CAP_CACHE_COHERENCY))
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/infiniband/hw/usnic/usnic_uiom.c:        if (!iommu_capable(dev->bus, IOMMU_CAP_CACHE_COHERENCY)) {
+user@DESKTOP-AVLTLKA:~$ GREP -R ^C
+user@DESKTOP-AVLTLKA:~$ grep -r ARM_SMMU_FEAT_COHERENCY linux-bpi/BPI-W2-bsp/linux-rtk
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/arm-smmu-v3.c:#define ARM_SMMU_FEAT_COHERENCY              (1 << 8)
+linux-bpi/BPI-W2-bsp/linux-rtk/drivers/iommu/arm-smmu-v3.c:             smmu->features |= ARM_SMMU_FEAT_COHERENCY;
+
+3. Comparison of updates to page allocation
+
+4.9: 
+
+int virtio_gpu_object_get_sg_table(struct virtio_gpu_device *qdev,
+                                   struct virtio_gpu_object *bo)
+{
+        int ret;
+        struct page **pages = bo->tbo.ttm->pages;
+        int nr_pages = bo->tbo.num_pages;
+
+        /* wtf swapping */
+        if (bo->pages)
+                return 0;
+
+        if (bo->tbo.ttm->state == tt_unpopulated)
+                bo->tbo.ttm->bdev->driver->ttm_tt_populate(bo->tbo.ttm);
+        bo->pages = kmalloc(sizeof(struct sg_table), GFP_KERNEL);
+        if (!bo->pages)
+                goto out;
+
+        ret = sg_alloc_table_from_pages(bo->pages, pages, nr_pages, 0,
+                                        nr_pages << PAGE_SHIFT, GFP_KERNEL);
+        if (ret)
+                goto out;
+        return 0;
+out:
+        kfree(bo->pages);
+        bo->pages = NULL;
+        return -ENOMEM;
+}
+
+int virtio_gpu_object_create(struct virtio_gpu_device *vgdev,
+                             unsigned long size, bool kernel, bool pinned,
+                             struct virtio_gpu_object **bo_ptr)
+{
+        struct virtio_gpu_object *bo;
+        enum ttm_bo_type type;
+        size_t acc_size;
+        int ret;
+
+        if (kernel)
+                type = ttm_bo_type_kernel;
+        else
+                type = ttm_bo_type_device;
+        *bo_ptr = NULL;
+
+        acc_size = ttm_bo_dma_acc_size(&vgdev->mman.bdev, size,
+                                       sizeof(struct virtio_gpu_object));
+
+        bo = kzalloc(sizeof(struct virtio_gpu_object), GFP_KERNEL);
+        if (bo == NULL)
+                return -ENOMEM;
+        size = roundup(size, PAGE_SIZE);
+        ret = drm_gem_object_init(vgdev->ddev, &bo->gem_base, size);
+        if (ret != 0) {
+                kfree(bo);
+                return ret;
+        }
+        bo->dumb = false;
+        virtio_gpu_init_ttm_placement(bo, pinned);
+
+        ret = ttm_bo_init(&vgdev->mman.bdev, &bo->tbo, size, type,
+                          &bo->placement, 0, !kernel, NULL, acc_size,
+                          NULL, NULL, &virtio_gpu_ttm_bo_destroy);
+        /* ttm_bo_init failure will call the destroy */
+        if (ret != 0)
+                return ret;
+
+        *bo_ptr = bo;
+        return 0;
+}
+
+6.0:
+
+int virtio_gpu_object_create(struct virtio_gpu_device *vgdev,
+                             struct virtio_gpu_object_params *params,
+                             struct virtio_gpu_object **bo_ptr,
+                             struct virtio_gpu_fence *fence)
+{
+        struct virtio_gpu_object_array *objs = NULL;
+        struct drm_gem_shmem_object *shmem_obj;
+        struct virtio_gpu_object *bo;
+        struct virtio_gpu_mem_entry *ents;
+        unsigned int nents;
+        int ret;
+
+        *bo_ptr = NULL;
+
+        params->size = roundup(params->size, PAGE_SIZE);
+        shmem_obj = drm_gem_shmem_create(vgdev->ddev, params->size);
+        if (IS_ERR(shmem_obj))
+                return PTR_ERR(shmem_obj);
+        bo = gem_to_virtio_gpu_obj(&shmem_obj->base);
+
+        ret = virtio_gpu_resource_id_get(vgdev, &bo->hw_res_handle);
+        if (ret < 0)
+                goto err_free_gem;
+
+        bo->dumb = params->dumb;
+
+        ret = virtio_gpu_object_shmem_init(vgdev, bo, &ents, &nents);
+        if (ret != 0)
+                goto err_put_id;
+
+        if (fence) {
+                ret = -ENOMEM;
+                objs = virtio_gpu_array_alloc(1);
+                if (!objs)
+                        goto err_put_id;
+                virtio_gpu_array_add_obj(objs, &bo->base.base);
+
+                ret = virtio_gpu_array_lock_resv(objs);
+                if (ret != 0)
+                        goto err_put_objs;
+        }
+
+        if (params->blob) {
+                if (params->blob_mem == VIRTGPU_BLOB_MEM_GUEST)
+                        bo->guest_blob = true;
+
+                virtio_gpu_cmd_resource_create_blob(vgdev, bo, params,
+                                                    ents, nents);
+        } else if (params->virgl) {
+                virtio_gpu_cmd_resource_create_3d(vgdev, bo, params,
+                                                  objs, fence);
+                virtio_gpu_object_attach(vgdev, bo, ents, nents);
+        } else {
+                virtio_gpu_cmd_create_resource(vgdev, bo, params,
+                                               objs, fence);
+                virtio_gpu_object_attach(vgdev, bo, ents, nents);
+        }
+
+        *bo_ptr = bo;
+        return 0;
+
+err_put_objs:
+        virtio_gpu_array_put_free(objs);
+err_put_id:
+        virtio_gpu_resource_id_put(vgdev, bo->hw_res_handle);
+err_free_gem:
+        drm_gem_shmem_free(shmem_obj);
+        return ret;
+}
+
+static int virtio_gpu_object_shmem_init(struct virtio_gpu_device *vgdev,
+                                        struct virtio_gpu_object *bo,
+                                        struct virtio_gpu_mem_entry **ents,
+                                        unsigned int *nents)
+{
+        bool use_dma_api = !virtio_has_dma_quirk(vgdev->vdev);
+        struct scatterlist *sg;
+        struct sg_table *pages;
+        int si;
+
+        pages = drm_gem_shmem_get_pages_sgt(&bo->base);
+        if (IS_ERR(pages))
+                return PTR_ERR(pages);
+
+        if (use_dma_api)
+                *nents = pages->nents;
+        else
+                *nents = pages->orig_nents;
+
+        *ents = kvmalloc_array(*nents,
+                               sizeof(struct virtio_gpu_mem_entry),
+                               GFP_KERNEL);
+        if (!(*ents)) {
+                DRM_ERROR("failed to allocate ent list\n");
+                return -ENOMEM;
+        }
+
+        if (use_dma_api) {
+                for_each_sgtable_dma_sg(pages, sg, si) {
+                        (*ents)[si].addr = cpu_to_le64(sg_dma_address(sg));
+                        (*ents)[si].length = cpu_to_le32(sg_dma_len(sg));
+                        (*ents)[si].padding = 0;
+                }
+        } else {
+                for_each_sgtable_sg(pages, sg, si) {
+                        (*ents)[si].addr = cpu_to_le64(sg_phys(sg));
+                        (*ents)[si].length = cpu_to_le32(sg->length);
+                        (*ents)[si].padding = 0;
+                }
+        }
+
+        return 0;
+}
